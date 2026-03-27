@@ -1,0 +1,10 @@
+services:
+  ffmpeg-media-api:
+    build: .
+    container_name: ffmpeg-media-api
+    ports:
+      - "3223:3000"
+    restart: unless-stopped
+    # Optional: set a custom port inside the container
+    # environment:
+    #   - PORT=3000
