@@ -1562,7 +1562,8 @@ app.post("/probe", upload.single("file"), async (req, res) => {
 
 // ── Start ─────────────────────────────────────────────────────────────────────
 
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
   console.log(`ffmpeg-media-api running on port ${PORT}`);
   console.log(`GET http://localhost:${PORT}/ for endpoint listing`);
 });
+server.setTimeout(600000); // 10 min for long renders
