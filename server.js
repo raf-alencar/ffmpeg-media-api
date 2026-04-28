@@ -96,6 +96,16 @@ function ffmpegError(res, err, context) {
   res.status(500).json({ error: `${context} failed`, details: stderr });
 }
 
+// atempo only accepts 0.5–2.0; chain multiple filters for values outside that range
+function buildAtempoChain(speed) {
+  const filters = [];
+  let s = speed;
+  while (s > 2.0) { filters.push("atempo=2.0"); s /= 2.0; }
+  while (s < 0.5) { filters.push("atempo=0.5"); s *= 2.0; }
+  filters.push(`atempo=${s.toFixed(6)}`);
+  return filters.join(",");
+}
+
 // ── Multer ────────────────────────────────────────────────────────────────────
 
 const upload = multer({ dest: os.tmpdir() });
@@ -112,7 +122,7 @@ app.get("/", (req, res) => {
       // AUDIO
       { path: "/audio/normalize",   methods: ["POST"], description: "EBU R128 loudnorm. Body: { audio_url } or upload field: audio." },
       { path: "/audio/concat",      methods: ["POST"], description: "Join audio files in order. Body: { urls: [] } or upload field: audio (multiple)." },
-      { path: "/audio/assemble",    methods: ["POST"], description: "Podcast assembly: ordered clips + pause_after_ms gaps. Body: { clips: [{url, pause_after_ms}], normalize, output_format }." },
+      { path: "/audio/assemble",    methods: ["POST"], description: "Podcast assembly: ordered clips + pause_after_ms gaps. Body: { clips: [{url, pause_after_ms}], normalize, output_format, speed }." },
       { path: "/audio/mix-music",   methods: ["POST"], description: "Layer background music under speech. Body: { speech_url, music_url, music_volume, loop_music }." },
       { path: "/audio/trim",        methods: ["POST"], description: "Trim audio to start/end points. Body: { audio_url, start_s, end_s }." },
       { path: "/audio/fade",        methods: ["POST"], description: "Fade audio in, out, or both. Body: { audio_url, fade_type, fade_duration_s }." },
@@ -247,7 +257,8 @@ app.post("/audio/concat", upload.fields([{ name: "audio", maxCount: 500 }]), asy
 //   music_url: optional,
 //   music_volume: 0.08,
 //   loop_music: true,
-//   output_format: "mp3"
+//   output_format: "mp3",
+//   speed: 1.0   — optional atempo speed multiplier applied after all other processing
 // }
 app.post("/audio/assemble", async (req, res) => {
   const { clips, normalize = true, music_url, music_volume = 0.08, loop_music = true } = req.body;
@@ -255,9 +266,14 @@ app.post("/audio/assemble", async (req, res) => {
     return res.status(400).json({ error: "Body must include clips array: [{ url, pause_after_ms }]" });
   }
 
+  const speed = parseFloat(req.body?.speed ?? "1.0");
+  if (isNaN(speed) || speed <= 0) {
+    return res.status(400).json({ error: "speed must be a positive number" });
+  }
+
   const temps    = [];
   const segments = [];
-  let listFile, merged, normalized, withMusic;
+  let listFile, merged, normalized, withMusic, sped;
 
   try {
     const ar = parseInt(req.body?.ar ?? "44100", 10);
@@ -323,11 +339,21 @@ app.post("/audio/assemble", async (req, res) => {
       current = withMusic;
     }
 
+    // 5. Optional speed adjustment via atempo
+    if (speed !== 1.0) {
+      sped = tmpFile(".mp3");
+      // atempo accepts 0.5–2.0; chain filters for values outside that range
+      const atempoFilters = buildAtempoChain(speed);
+      execSync(`ffmpeg -y -i "${current}" -af "${atempoFilters}" -c:a libmp3lame -q:a 2 -ar ${ar} "${sped}"`, { stdio: "pipe" });
+      cleanup(current);
+      current = sped;
+    }
+
     sendFile(res, current, "episode.mp3", "audio/mpeg");
 
   } catch (err) {
     cleanupAll(temps);
-    cleanup(listFile, merged, normalized, withMusic);
+    cleanup(listFile, merged, normalized, withMusic, sped);
     ffmpegError(res, err, "audio/assemble");
   }
 });
@@ -1130,17 +1156,23 @@ app.post("/render/episode", async (req, res) => {
 //   width:   number  — default 1920
 //   height:  number  — default 1080
 //   fps:     number  — default 25
+//   speed:   number  — default 1.0; playback speed multiplier applied to final output
 // }
 app.post("/video/assemble", async (req, res) => {
   const temps     = [];
   const clipFiles = [];
-  let output;
+  let output, sped;
 
   try {
     const { clips, width = 1920, height = 1080, fps = 25 } = req.body;
 
     if (!clips || !Array.isArray(clips) || clips.length === 0) {
       return res.status(400).json({ error: "Requires clips array" });
+    }
+
+    const speed = parseFloat(req.body?.speed ?? "1.0");
+    if (isNaN(speed) || speed <= 0) {
+      return res.status(400).json({ error: "speed must be a positive number" });
     }
 
     const W = parseInt(width,  10) % 2 === 0 ? parseInt(width,  10) : parseInt(width,  10) + 1;
@@ -1291,12 +1323,24 @@ app.post("/video/assemble", async (req, res) => {
     }
 
     cleanupAll(clipFiles);
+
+    // Optional speed adjustment — setpts=PTS/speed compresses or stretches presentation timestamps
+    if (speed !== 1.0) {
+      sped = tmpFile(".mp4");
+      execSync(
+        `ffmpeg -y -i "${output}" -vf "setpts=PTS/${speed}" -r ${FPS} -c:v libx264 -pix_fmt yuv420p -an "${sped}"`,
+        { stdio: "pipe" }
+      );
+      cleanup(output);
+      output = sped;
+    }
+
     sendFile(res, output, "assembled.mp4", "video/mp4");
 
   } catch (err) {
     cleanupAll(temps);
     cleanupAll(clipFiles);
-    cleanup(output);
+    cleanup(output, sped);
     ffmpegError(res, err, "video/assemble");
   }
 });
